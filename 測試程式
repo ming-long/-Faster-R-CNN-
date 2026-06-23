@@ -1,0 +1,169 @@
+import os
+import torch
+import torchvision
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from PIL import Image
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from google.colab import drive
+
+
+
+
+# ==============================================================================
+# 1. 環境配置與雲端硬碟掛載
+# ==============================================================================
+# 掛載 Google 雲端硬碟
+drive.mount('/content/drive')
+# 設定運算裝置（優先使用 GPU）
+device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+
+
+
+# 🎯 根據資料集 names 完全對齊 (外加背景偏移)，標籤改為英文
+TARGET_MAP = {
+    1: {"name": "helmet_blue", "color": "#0000FF"},  # 藍色安全帽
+    2: {"name": "helmet_red", "color": "#FF0000"},   # 紅色安全帽
+    3: {"name": "helmet_white", "color": "#FFFFFF"},  # 白色安全帽
+    4: {"name": "helmet_yellow", "color": "#FFFF00"}, # 黃色安全帽
+    5: {"name": "person", "color": "#00FF00"},    # 人
+    6: {"name": "vest", "color": "#FF00FF"}     # 背心
+}
+
+
+
+
+# 🎯 模型儲存權重路徑
+weights_path = "/content/drive/MyDrive/114-2/深度學習/faster_rcnn.pth"
+
+
+
+
+# 🎯 測試的圖片路徑
+test_image_path = "/content/drive/MyDrive/114-2/深度學習/My First Project.v17i.yolov8/test/images/ppe_0755_jpg.rf.07925eb77c29c1ec9b5498d832ca77b6.jpg"
+
+
+
+
+plt.rcParams['axes.unicode_minus'] = False
+
+
+
+
+# ==============================================================================
+# 2. 載入模型架構與權重 (總類別數: 6類 + 1背景 = 7)
+# ==============================================================================
+def load_trained_model(weights_p, num_classes=7):
+    # 初始化 Faster R-CNN 模型架構
+    model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=False)
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+
+
+
+
+    # 檢查權重檔並載入
+    if os.path.exists(weights_p):
+        model.load_state_dict(torch.load(weights_p, map_location=device))
+        print(f"🎉 Successfully loaded weights file: {weights_p}")
+    else:
+        raise FileNotFoundError(f"❌ Weights file not found at: {weights_p}")
+    # Explicitly move the entire model to the target device
+    model.to(device)
+    return model
+
+
+
+
+# 呼叫函式載入模型
+model = load_trained_model(weights_path)
+
+
+
+
+# ==============================================================================
+# 3. 讀取影像與精準推論
+# ==============================================================================
+if os.path.exists(test_image_path):
+    # 讀取並轉換成 RGB 格式
+    pil_img = Image.open(test_image_path).convert("RGB")
+    # 將模型切換至評估模式
+    model.eval()
+
+
+
+
+    # 影像前處理並增加 Batch 維度
+    img_tensor = torchvision.transforms.functional.to_tensor(pil_img).unsqueeze(0).to(device)
+
+
+
+
+    # 關閉梯度計算進行推論
+    with torch.no_grad():
+        predictions = model(img_tensor)
+
+
+
+
+    # 將推論結果轉回 CPU 陣列以便繪圖
+    pred_boxes = predictions[0]['boxes'].cpu().numpy()
+    pred_scores = predictions[0]['scores'].cpu().numpy()
+    pred_labels = predictions[0]['labels'].cpu().numpy()
+
+
+
+
+    # 建立畫布與圖表
+    fig, ax = plt.subplots(figsize=(11, 9))
+    ax.imshow(pil_img)
+    box_count = 0
+
+
+
+
+    # 迭代所有預測框
+    for idx, score in enumerate(pred_scores):
+        # 🎯 信心度門檻設為 0.65，過濾低機率雜訊
+        if score > 0.65:
+            label_idx = int(pred_labels[idx])
+
+
+
+
+            if label_idx in TARGET_MAP:
+                box_count += 1
+                xmin, ymin, xmax, ymax = pred_boxes[idx]
+
+
+
+
+                # 英文名稱與顯色
+                cls_name = TARGET_MAP[label_idx]["name"]
+                rect_color = TARGET_MAP[label_idx]["color"]
+
+
+
+
+                # 繪製邊界預測框
+                rect = patches.Rectangle((xmin, ymin), xmax - xmin, ymax - ymin, linewidth=3, edgecolor=rect_color, facecolor='none')
+                ax.add_patch(rect)
+
+
+
+
+                # 寫上英文標籤與分數
+                ax.text(xmin, ymin - 10, f"{cls_name} {score:.2f}", color='white', fontsize=11, fontweight='bold',
+                        bbox=dict(facecolor=rect_color, alpha=0.8, edgecolor='none'))
+
+
+
+
+    # 設定英文圖片標題
+    plt.title(f"🔍 Faster R-CNN Real-time Detection Result ({box_count} objects detected)", fontsize=14, fontweight='bold')
+    plt.axis("off")
+    plt.show()
+else:
+    print(f"❌ Error: Test image file not found at: {test_image_path}")
+
