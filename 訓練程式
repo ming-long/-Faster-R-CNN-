@@ -1,0 +1,396 @@
+# ==============================================================================
+# 0. 環境準備與套件導入
+# ==============================================================================
+import os
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+
+
+from PIL import Image
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
+
+
+import torchvision
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from google.colab import drive
+
+
+# 裝置配置：優先使用 CUDA 核心進行 Tensor 運算
+device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+
+# 全域繪圖配置（英文輸出，防止亂碼）
+plt.rcParams['axes.unicode_minus'] = False
+
+
+# ==============================================================================
+# 1. 雲端硬碟掛載與【指定儲存路徑】配置
+# ==============================================================================
+print("\n====== Step 1: Mount Google Drive & Path Config ======")
+drive.mount('/content/drive')
+
+
+# 🚨 資料集基底路徑
+dataset_base_dir = "/content/drive/MyDrive/114-2/深度學習/My First Project.v17i.yolov8"
+
+
+# 🎯 期末專題儲存路徑
+save_weights_dir = "/content/drive/MyDrive/114-2/深度學習"
+os.makedirs(save_weights_dir, exist_ok=True)
+print(f"[System Notice] Weights and charts will be saved to: {save_weights_dir}")
+
+
+# 對齊 YOLO 資料集的 6 大核心目標類別 (全英文順序)
+CLASS_NAMES = ["helmet_blue", "helmet_red", "helmet_white", "helmet_yellow", "person", "vest"]
+NUM_CLASSES = len(CLASS_NAMES) + 1  # 6 類目標 + 1 類背景
+
+
+# ==============================================================================
+# 2. 定義自定義 PyTorch Dataset (YOLO ➔ 兩階段絕對座標變換)
+# ==============================================================================
+class ConstructionSiteDataset(Dataset):
+    def __init__(self, base_dir, split="train"):
+        self.img_dir = os.path.join(base_dir, split, "images")
+        self.label_dir = os.path.join(base_dir, split, "labels")
+
+
+        if os.path.exists(self.img_dir):
+            self.img_names = sorted([f for f in os.listdir(self.img_dir) if f.endswith(('.jpg', '.jpeg', '.png'))])
+        else:
+            self.img_names = []
+
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.img_dir, self.img_names[idx])
+        label_path = os.path.join(self.label_dir, self.img_names[idx].rsplit('.', 1)[0] + '.txt')
+
+
+        img = Image.open(img_path).convert("RGB")
+        W, H = img.size
+        img_tensor = torchvision.transforms.functional.to_tensor(img)
+
+
+        boxes, labels = [], []
+        if os.path.exists(label_path):
+            with open(label_path, 'r') as f:
+                for line in f.readlines():
+                    parts = line.strip().split()
+                    if len(parts) == 5:
+                        cls_id = int(parts[0]) + 1  # 配合 Faster R-CNN 背景偏移 +1
+                        x_c, y_c, w, h = map(float, parts[1:])
+
+
+                        xmin = (x_c - w / 2) * W
+                        ymin = (y_c - h / 2) * H
+                        xmax = (x_c + w / 2) * W
+                        ymax = (y_c + h / 2) * H
+
+
+                        xmin, xmax = max(0.0, xmin), min(float(W), xmax)
+                        ymin, ymax = max(0.0, ymin), min(float(H), ymax)
+
+
+                        if (xmax > xmin) and (ymax > ymin):
+                            boxes.append([xmin, ymin, xmax, ymax])
+                            labels.append(cls_id)
+
+
+        if len(boxes) == 0:
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.int64)
+        else:
+            boxes = torch.as_tensor(boxes, dtype=torch.float32)
+            labels = torch.as_tensor(labels, dtype=torch.int64)
+
+
+        target = {
+            "boxes": boxes,
+            "labels": labels,
+            "image_id": torch.tensor([idx]),
+            "area": (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0]) if len(boxes) > 0 else torch.tensor([0.0]),
+            "iscrowd": torch.zeros((len(boxes),), dtype=torch.int64)
+        }
+        return img_tensor, target
+
+
+    def __len__(self):
+        return len(self.img_names)
+
+
+# IoU 計算輔助函式
+def calculate_iou(boxA, boxB):
+    xA, yA = max(boxA[0], boxB[0]), max(boxA[1], boxB[1])
+    xB, yB = min(boxA[2], boxB[2]), min(boxA[3], boxB[3])
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+    return interArea / float(boxAArea + boxBArea - interArea) if (boxAArea + boxBArea - interArea) > 0 else 0
+
+
+# ==============================================================================
+# 3. 自定義神經網路模型初始化
+# ==============================================================================
+def create_pytorch_rcnn_model(num_classes):
+    model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    return model
+
+
+model = create_pytorch_rcnn_model(NUM_CLASSES).to(device)
+
+
+# ==============================================================================
+# 4. 核心深度訓練迴圈 (紀錄歷史 Loss)
+# ==============================================================================
+loss_history_total, loss_history_classifier, loss_history_box_reg = [], [], []
+
+
+train_dataset = ConstructionSiteDataset(dataset_base_dir, split="train")
+train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, collate_fn=lambda x: tuple(zip(*x)))
+
+
+optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=0.0005)
+epochs = 50
+
+
+print("\n====== Step 2: Training Start ======")
+for epoch in range(epochs):
+    model.train()
+    epoch_loss, epoch_cls_loss, epoch_box_loss = 0.0, 0.0, 0.0
+    start_t = time.time()
+
+
+    for images, targets in train_loader:
+        images = list(img.to(device) for img in images)
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+
+        loss_dict = model(images, targets)
+        losses = sum(loss for loss in loss_dict.values())
+
+
+        optimizer.zero_grad()
+        losses.backward()
+        optimizer.step()
+
+
+        epoch_loss += losses.item()
+        epoch_cls_loss += loss_dict['loss_classifier'].item()
+        epoch_box_loss += loss_dict['loss_box_reg'].item()
+
+
+    avg_loss = epoch_loss / len(train_loader)
+    loss_history_total.append(avg_loss)
+    loss_history_classifier.append(epoch_cls_loss / len(train_loader))
+    loss_history_box_reg.append(epoch_box_loss / len(train_loader))
+
+
+    print(f"Epoch [{epoch+1}/{epochs}] - Total Loss: {avg_loss:.4f} - Speed: {time.time()-start_t:.1f}s")
+
+
+# 儲存最終模型權重
+final_weights_path = os.path.join(save_weights_dir, "faster_rcnn.pth")
+torch.save(model.state_dict(), final_weights_path)
+print(f"🎉 [Success] Training completed! Weights saved to: {final_weights_path}")
+
+
+# ==============================================================================
+# 5. 執行測試集推論與數據蒐集
+# ==============================================================================
+print("\n====== Step 3: Evaluation Start (Test Dataset) ======")
+model.eval()
+
+
+test_dataset = ConstructionSiteDataset(dataset_base_dir, split="test")
+test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, collate_fn=lambda x: tuple(zip(*x)))
+
+
+all_true_labels, all_true_boxes, all_pred_scores, all_tp_fp_mask = [], [], [], []
+cm_true_labels, cm_pred_labels = [], []
+
+
+print("⏳ 正在執行測試集推論（進行 1:1 空間特徵比對）...")
+with torch.no_grad():
+    for images, targets in test_loader:
+        images = list(img.to(device) for img in images)
+        predictions = model(images)
+
+
+        for tgt, pred in zip(targets, predictions):
+            gt_boxes = tgt['boxes'].numpy()
+            gt_labels = tgt['labels'].numpy()  # 1 到 6
+            p_boxes = pred['boxes'].cpu().numpy()
+            p_scores = pred['scores'].cpu().numpy()
+            p_labels = pred['labels'].cpu().numpy()  # 1 到 6
+
+
+            # 統計基礎分佈用 (轉換回 0-indexed)
+            for b, l in zip(gt_boxes, gt_labels):
+                all_true_labels.append(l - 1)
+                all_true_boxes.append([b[2] - b[0], b[3] - b[1]])
+
+
+            # 過濾置信度低於 0.15 的預測框
+            conf_thres = 0.15
+            valid_idx = p_scores >= conf_thres
+            valid_p_boxes = p_boxes[valid_idx]
+            valid_p_labels = p_labels[valid_idx]
+            valid_p_scores = p_scores[valid_idx]
+
+
+            matched_gts = set()
+
+
+            # 逐一檢查模型出來的預測框
+            for p_box, p_score, p_lbl in zip(valid_p_boxes, valid_p_scores, valid_p_labels):
+                all_pred_scores.append(p_score)
+                is_tp, best_iou, best_gt_idx = 0, 0, -1
+
+
+                for gt_idx, gt_box in enumerate(gt_boxes):
+                    iou = calculate_iou(p_box, gt_box)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_gt_idx = gt_idx
+
+
+                # 7x7 混淆矩陣填充邏輯 (0-5: 核心目標, 6: Background)
+                if best_iou >= 0.50 and best_gt_idx != -1:
+                    actual_lbl = gt_labels[best_gt_idx]
+                    if p_lbl == actual_lbl:
+                        is_tp = 1
+                        matched_gts.add(best_gt_idx)
+
+
+                    # 情況 A：模型有抓到東西，記錄對應的看對或看錯標籤
+                    cm_true_labels.append(actual_lbl - 1)
+                    cm_pred_labels.append(p_lbl - 1)
+                else:
+                    # 情況 B (False Positive)：模型對著空氣瞎猜，真實是背景(6)，模型猜 p_lbl-1
+                    cm_true_labels.append(6)
+                    cm_pred_labels.append(p_lbl - 1)
+
+
+                all_tp_fp_mask.append(is_tp)
+
+
+            # 情況 C (False Negative)：模型完全漏抓的真實目標，真實是 gt_lbl-1，模型猜背景(6)
+            for gt_idx, gt_lbl in enumerate(gt_labels):
+                if gt_idx not in matched_gts:
+                    cm_true_labels.append(gt_lbl - 1)
+                    cm_pred_labels.append(6)
+
+
+all_true_labels = np.array(all_true_labels)
+all_true_boxes = np.array(all_true_boxes) if len(all_true_boxes) > 0 else np.zeros((0, 2))
+all_pred_scores = np.array(all_pred_scores)
+all_tp_fp_mask = np.array(all_tp_fp_mask)
+
+
+# ==============================================================================
+# 6. 綜合指標圖表繪製
+# ==============================================================================
+fig, axes = plt.subplots(4, 2, figsize=(16, 22))
+fig.suptitle("PyTorch Faster R-CNN PPE System - Comprehensive Training & Evaluation Report", fontsize=20, fontweight='bold', y=0.98)
+
+
+# 圖 1：標籤數量統計
+counts = [np.sum(all_true_labels == i) for i in range(len(CLASS_NAMES))]
+axes[0, 0].bar(CLASS_NAMES, counts, color=['#0000FF', '#FF0000', '#FFFFFF', '#FFFF00', '#00FF00', '#FF00FF'], edgecolor='black')
+axes[0, 0].set_title("1. Real Labels Distribution (Test Dataset)", fontsize=12, fontweight='bold')
+axes[0, 0].set_xticks(range(len(CLASS_NAMES)))
+axes[0, 0].set_xticklabels(CLASS_NAMES, rotation=15)
+axes[0, 0].grid(axis='y', linestyle='--', alpha=0.7)
+
+
+# 圖 2：標註特徵相關圖
+if len(all_true_boxes) > 0:
+    axes[0, 1].scatter(all_true_boxes[:, 0], all_true_boxes[:, 1], c=all_true_labels, cmap='jet', alpha=0.6, s=20)
+axes[0, 1].set_title("2. Labels Correlogram (Object Width vs Height)", fontsize=12, fontweight='bold')
+axes[0, 1].set_xlabel("Width (pixels)"); axes[0, 1].set_ylabel("Height (pixels)")
+
+
+# 計算 P/R/F1 核心演算法曲線
+thresholds = np.linspace(0.0, 1.0, 100)
+precisions, recalls, f1_scores = [], [], []
+total_num_gt = len(all_true_labels) if len(all_true_labels) > 0 else 1
+
+
+for t in thresholds:
+    match = all_pred_scores >= t
+    if np.sum(match) == 0:
+        p, r = 1.0, 0.0
+    else:
+        tp = np.sum(all_tp_fp_mask[match])
+        fp = np.sum(1 - all_tp_fp_mask[match])
+        p = tp / (tp + fp) if (tp + fp) > 0 else 1.0
+        r = tp / total_num_gt
+    precisions.append(p); recalls.append(r)
+    f1_scores.append(2 * (p * r) / (p + r) if (p + r) > 0 else 0)
+
+
+# 圖 3 到 圖 6 (效能指標曲線)
+axes[1, 0].plot(thresholds, recalls, color='blue', linewidth=2.5)
+axes[1, 0].set_title("3. Recall-Confidence Curve", fontsize=12, fontweight='bold')
+axes[1, 0].set_xlim(0, 1); axes[1, 0].set_ylim(0, 1); axes[1, 0].grid(True)
+
+
+axes[1, 1].plot(recalls, precisions, color='purple', linewidth=2.5)
+axes[1, 1].fill_between(recalls, precisions, alpha=0.1, color='purple')
+axes[1, 1].set_title("4. Precision-Recall Curve (PR Curve)", fontsize=12, fontweight='bold')
+axes[1, 1].set_xlim(0, 1); axes[1, 1].set_ylim(0, 1); axes[1, 1].grid(True)
+
+
+axes[2, 0].plot(thresholds, precisions, color='green', linewidth=2.5)
+axes[2, 0].set_title("5. Precision-Confidence Curve", fontsize=12, fontweight='bold')
+axes[2, 0].set_xlim(0, 1); axes[2, 0].set_ylim(0, 1); axes[2, 0].grid(True)
+
+
+axes[2, 1].plot(thresholds, f1_scores, color='red', linewidth=2.5)
+axes[2, 1].set_title("6. F1-Confidence Curve", fontsize=12, fontweight='bold')
+axes[2, 1].set_xlim(0, 1); axes[2, 1].set_ylim(0, 1); axes[2, 1].grid(True)
+
+
+# 💡 圖 7： 7x7 歸一化混淆矩陣 (加入 Background)
+CM_LABELS = CLASS_NAMES + ["Background"]
+if len(cm_true_labels) > 0:
+    cm = confusion_matrix(cm_true_labels, cm_pred_labels, labels=list(range(7)))
+    cm_norm = cm.astype('float') / (cm.sum(axis=1)[:, np.newaxis] + 1e-6)
+    sns.heatmap(cm_norm, annot=True, fmt=".2f", cmap="Blues", ax=axes[3, 0], xticklabels=CM_LABELS, yticklabels=CM_LABELS, cbar=False)
+else:
+    sns.heatmap(np.zeros((7, 7)), annot=True, fmt=".2f", cmap="Blues", ax=axes[3, 0], xticklabels=CM_LABELS, yticklabels=CM_LABELS, cbar=False)
+axes[3, 0].set_title("7. Confusion Matrix (Real 7x7 Grid with Background)", fontsize=12, fontweight='bold')
+axes[3, 0].set_xticks(np.arange(7) + 0.5)
+axes[3, 0].set_xticklabels(CM_LABELS, rotation=15)
+
+
+# 💡 圖 8：訓練收斂日誌 (同步繪製三合一損失)
+if len(loss_history_total) > 0:
+    axes[3, 1].plot(loss_history_total, color='black', linewidth=2.5, label='Total Loss')
+    axes[3, 1].plot(loss_history_classifier, color='green', linestyle='--', alpha=0.7, label='Classifier Loss')
+    axes[3, 1].plot(loss_history_box_reg, color='blue', linestyle='--', alpha=0.7, label='Box Reg Loss')
+    axes[3, 1].set_title("8. Loss Curve (Original Training History)", fontsize=12, fontweight='bold')
+    axes[3, 1].set_xlabel("Epochs")
+    axes[3, 1].set_ylabel("Loss")
+else:
+    axes[3, 1].text(0.5, 0.5, 'No active training data in memory.', ha='center', va='center', color='red')
+    axes[3, 1].set_title("8. Loss Curve (No Data)", fontsize=12, fontweight='bold')
+axes[3, 1].grid(True, linestyle=':', alpha=0.6)
+axes[3, 1].legend()
+
+
+# 儲存並輸出成果圖
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+final_chart_path = os.path.join(save_weights_dir, "standalone_evaluation_matrix.png")
+plt.savefig(final_chart_path, dpi=300)
+print(f"\n🎉 [Success] 數據指標圖表已產出並儲存至：{final_chart_path}")
+plt.show()
+
