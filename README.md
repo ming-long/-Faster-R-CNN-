@@ -12,3 +12,5 @@
 1:1 特徵配對評估：測試時把模型切換到測試模式（eval()）。用交併比（IoU）來比對，模型的預測框跟真實的標註框疊合面積必須大於等於 50%（IoU >= 0.50），才算是有抓對地方。
 
 7x7 混淆矩陣：為了看清模型的缺點，把「背景」算進去。如果模型把路燈或強光誤看成是背心（虛警），就會被歸類在混淆矩陣的背景列；如果是真實存在的安全帽模型卻沒看到（漏檢），就會被歸類在背景行。最後做出一個包含 6 類目標 + 1 類背景的 7x7 混淆矩陣，並且畫出 Precision、Recall、PR、F1 曲線，以及 Loss 下降圖。
+<img width="457" height="627" alt="螢幕擷取畫面 2026-06-21 115512" src="https://github.com/user-attachments/assets/b6799873-ae9d-4373-b47e-cbdd047bc231" />
+<img width="675" height="647" alt="螢幕擷取畫面 2026-06-21 100408" src="https://github.com/user-attachments/assets/10dd6bdc-f5b2-45be-8714-a6b5278548bd" />
